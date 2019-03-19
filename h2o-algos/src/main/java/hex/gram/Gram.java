@@ -21,6 +21,7 @@ public final class Gram extends Iced<Gram> {
   final int _denseN;
   int _fullN;
   final static int MIN_TSKSZ=10000;
+  boolean _multinomialSpeedUp = false;
 
   private static class XXCache {
     public final boolean lowerDiag;
@@ -53,6 +54,21 @@ public final class Gram extends Iced<Gram> {
       _xx[i] = MemoryManager.malloc8d(diag + i + 1);
   }
 
+  /**
+   * This constructor is used only by multinomial speedup and no other algos
+   * @param N
+   * @param hasIntercept
+   */
+  public Gram(int N, int dense, boolean hasIntercept) {
+    _hasIntercept = hasIntercept;
+    _fullN = N;
+    _denseN = dense;
+    _xx = new double[_fullN][];
+    for( int i = 0; i < _fullN; ++i )
+      _xx[i] = MemoryManager.malloc8d(i+1);
+    _multinomialSpeedUp=true; // set speedup flag. 
+  }
+  
   public Gram(double[][] xxCacheNew) {
     _xx = xxCacheNew;
     _xxCache = new XXCache(xxCacheNew,false,false);
@@ -741,6 +757,154 @@ public final class Gram extends Iced<Gram> {
       addRowDense(row,w);
     else
       addRowSparse(row, w);
+  }
+  
+  public final void addRow(DataInfo.Row row, double[][] w, int nclass, int coeffPClass, int totColNumber, 
+                           int numCoeffOffset, boolean hasIntercept) {
+    if (row.numIds==null)
+      addRowDense(row, w, nclass, coeffPClass, numCoeffOffset, hasIntercept);
+    else
+      addRowSparse(row, w, nclass, coeffPClass, hasIntercept);
+  }
+
+  /***
+   * This will add each training sample's contribution to the gram matrix which is Transpose(X)*w*X where w is
+   * nclass by nclass, X is nclass by nclass*coeffPClass.  For simplicity, I did not implement any diagonals.
+   * 
+   * @param row
+   * @param w
+   * @param nclass
+   * @param coeffPClass
+   * @param hasIntercept
+   */
+  public final void addRowDense(DataInfo.Row row, double[][] w, int nclass, int coeffPClass, int numCoeffOffset, 
+                                boolean hasIntercept) {
+    int numColStart = row.nBins;
+    // cat by cat
+    for (int rowInd = 0; rowInd < numColStart; rowInd++) {  // row of predictor
+      for (int colInd = 0; colInd <= rowInd; colInd++) {  // col of predictor
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + row.binIds[rowInd]][cClassInd * coeffPClass + row.binIds[colInd]] +=
+                    w[rClassInd][cClassInd];
+          }
+        }
+      }
+    }
+    for (int rowInd = 0; rowInd < _denseN; rowInd++) {  // row of predictor
+      // num by num
+      for (int colInd = 0; colInd <= rowInd; colInd++) {  // col of predictor
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + rowInd + numCoeffOffset][cClassInd * coeffPClass + colInd + numCoeffOffset] += 
+                    w[rClassInd][cClassInd]*row.numVals[rowInd]*row.numVals[colInd];
+          }
+        }
+      }
+      // num by enum
+      for (int colInd = 0; colInd < numColStart; colInd++) {  // col of predictor
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + rowInd + numCoeffOffset][cClassInd * coeffPClass + row.binIds[colInd]] += 
+                    w[rClassInd][cClassInd]*
+                    row.numVals[rowInd];
+          }
+        }
+      }
+    }
+    // deal with intercepts
+    if (hasIntercept) {
+      // cat with intercept
+      for (int colInd=0; colInd < numColStart; colInd++) {
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[(rClassInd+1) * coeffPClass -1][cClassInd * coeffPClass + row.binIds[colInd]] +=
+                    w[rClassInd][cClassInd];
+          }
+        }
+      }
+      // num with intercept
+      for (int colInd=0; colInd < _denseN; colInd++) {
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[(rClassInd+1) * coeffPClass -1][cClassInd * coeffPClass + colInd + numCoeffOffset] +=
+                    w[rClassInd][cClassInd]*row.numVals[colInd];
+          }
+        }
+      }
+      // intercept with intercept
+      for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+        for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+          _xx[(rClassInd+1) * coeffPClass -1][(rClassInd+1) * coeffPClass -1] += w[rClassInd][cClassInd];
+        }
+      }
+    }
+  }
+
+  public final void addRowSparse(DataInfo.Row row, double[][] w, int nclass, int coeffPClass, boolean hasIntercept) {
+    int numColStart = row.nBins;
+    // cat by cat, same as addRowDense
+    for (int rowInd = 0; rowInd < numColStart; rowInd++) {  // row of predictor
+      for (int colInd = 0; colInd <= rowInd; colInd++) {  // col of predictor
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + row.binIds[rowInd]][cClassInd * coeffPClass + row.binIds[colInd]] +=
+                    w[rClassInd][cClassInd];
+          }
+        }
+      }
+    }
+    for (int i = 0; i < _denseN; i++) {  // row of predictor
+      // num by num
+      int rowInd = row.numIds[i];
+      for (int j = 0; j <= i; j++) {  // col of predictor
+        int colInd = row.numIds[j];
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + rowInd][cClassInd * coeffPClass + colInd] +=
+                    w[rClassInd][cClassInd]*row.numVals[i]*row.numVals[j];
+          }
+        }
+      }
+      // num by enum
+      for (int colInd = 0; colInd <= numColStart; colInd++) {  // col of predictor
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[rClassInd * coeffPClass + rowInd][cClassInd * coeffPClass + row.binIds[colInd]] +=
+                    w[rClassInd][cClassInd]*
+                            row.numVals[i];
+          }
+        }
+      }
+    }
+    // deal with intercepts
+    if (hasIntercept) {
+      // cat with intercept
+      for (int colInd=0; colInd < row.nBins; colInd++) {
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[(rClassInd+1) * coeffPClass -1][cClassInd * coeffPClass + row.binIds[colInd]] +=
+                    w[rClassInd][cClassInd];
+          }
+        }
+      }
+      // num with intercept
+      for (int j=0; j < _denseN; j++) {
+        int colInd = row.numIds[j];
+        for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+          for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+            _xx[(rClassInd+1) * coeffPClass -1][cClassInd * coeffPClass + colInd] +=
+                    w[rClassInd][cClassInd]*row.numVals[colInd];
+          }
+        }
+      }
+      // intercept with intercept
+      for (int rClassInd = 0; rClassInd < nclass; rClassInd++) {
+        for (int cClassInd = 0; cClassInd <= rClassInd; cClassInd++) {
+          _xx[(rClassInd+1) * coeffPClass -1][(rClassInd+1) * coeffPClass -1] += w[rClassInd][cClassInd];
+        }
+      }
+    }
   }
 
   public final void   addRowDense(DataInfo.Row row, double w) {

@@ -17,7 +17,10 @@ import water.exceptions.H2OIllegalArgumentException;
 import water.fvec.Frame;
 import water.fvec.Vec;
 import water.util.ArrayUtils;
+
+import java.util.Arrays;
 import java.util.Random;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -506,19 +509,247 @@ public class GLMBasicTestMultinomial extends TestUtil {
     }
   }
 
+  /**
+   * I am testing the generation of gram matrix and the XY
+   */
   @Test
-  public void testMultinomialGradientSpeedUp(){
+  public void testMultinomialHessianXYSpeedUp(){
     Scope.enter();
-    Key parsed = Key.make("covtype");
+    Key parsed = Key.make("hessianxy");
     Frame fr, f1, f2, f3;
-    Vec origRes = null;
     // get new coefficients, 7 classes and 53 predictor+intercept
     Random rand = new Random();
     rand.setSeed(12345);
     int nclass = 4;
     double threshold = 1e-10;
     DataInfo dinfo=null;
-    int numRows = 4000;
+    int numRows = 40;
+
+    try {
+      f1 = TestUtil.generate_enum_only(2, numRows, nclass, 0);
+      Scope.track(f1);
+      f2 = TestUtil.generate_real_only(2, numRows, 0);
+      Scope.track(f2);
+      f3 = TestUtil.generate_enum_only(1, numRows, nclass, 0);
+      Scope.track(f3);
+      fr = f1.add(f2).add(f3);  // complete frame generation
+      Scope.track(fr);
+      GLMParameters params = new GLMParameters(Family.multinomial);
+      params._response_column = f1._names[4];
+      params._ignored_columns = new String[]{};
+      params._train = fr._key;
+      params._lambda = new double[]{0.5};
+      params._alpha = new double[]{0.5};
+      params._solver = Solver.IRLSM_SPEEDUP;
+      
+      GLMModel.GLMWeightsFun glmw = new GLMModel.GLMWeightsFun(params);
+      dinfo = new DataInfo(fr, null, 1, true, DataInfo.TransformType.STANDARDIZE, DataInfo.TransformType.NONE, true, false, false, false, false, false);
+      int ncoeffPClass = dinfo.fullN()+1;
+      double sumExp = 0;
+      double[] beta = new double[nclass*ncoeffPClass];
+      for (int ind = 0; ind < beta.length; ind++) {
+        beta[ind] = rand.nextDouble();
+      }
+      int P = dinfo.fullN();       // number of predictors
+      int N = dinfo.fullN() + 1;   // number of GLM coefficients per class
+      for (int i = 1; i < nclass; ++i)
+        sumExp += Math.exp(beta[i * N + P]);
+
+      Vec [] vecs = dinfo._adaptedFrame.anyVec().makeDoubles(2, new double[]{sumExp,0});  // store sum exp and maxRow
+      dinfo.addResponse(new String[]{"__glm_sumExp", "__glm_logSumExp"}, vecs);
+      Scope.track(vecs[0]);
+      Scope.track(vecs[1]);
+      // calculate Hessian, xy and likelihood manually
+      double[][] hessian = new double[beta.length][beta.length];
+      double[] xy = new double[beta.length];
+      double manualLLH = manualHessianXYLLH(beta, hessian, xy, dinfo, nclass, ncoeffPClass);
+      GLMTask.GLMIterationTask gmt = new GLMTask.GLMIterationTask(null,dinfo,glmw,beta,
+              nclass).doAll(dinfo._adaptedFrame);
+
+      // check likelihood calculation;
+      assertEquals(manualLLH, gmt._likelihood, threshold);
+      // check hessian
+      double[][] glmHessian = gmt.getGram().getXX();
+      for (int gramInd = 0; gramInd < hessian.length; gramInd++) {
+        TestUtil.checkArrays(glmHessian[gramInd], hessian[gramInd], threshold);
+      }
+
+    } finally {
+      if (dinfo!=null)
+        dinfo.remove();
+      Scope.exit();
+    }
+  }
+  
+  public double manualHessianXYLLH(double[] initialBeta, double[][] hessian, double[] xy, DataInfo dinfo, int nclass, 
+                                   int ncoeffPClass) {
+    double likelihood = 0;
+    int numRows = (int) dinfo._adaptedFrame.numRows();
+    int respInd = dinfo._adaptedFrame.numCols() - 1;
+    double[] etas = new double[nclass];
+    double[] probs = new double[nclass + 1];
+    double[][] multinomialBetas = new double[nclass][ncoeffPClass];
+    double[][] w = new double[nclass][nclass]; // reuse for each row
+    double[] wz = new double[nclass];           // reuse for each row
+    double[][] xtx = new double[ncoeffPClass][ncoeffPClass];
+    for (int classInd = 0; classInd < nclass; classInd++) {
+      System.arraycopy(initialBeta,classInd*ncoeffPClass, multinomialBetas[classInd], 0, ncoeffPClass);
+    }
+    // calculate the etas for each class
+    for (int rowInd = 0; rowInd < numRows; rowInd++) { // work through each row
+      for (int classInd = 0; classInd < nclass; classInd++) { // calculate beta*coeff+beta0
+        etas[classInd] = getInnerProduct(rowInd, multinomialBetas[classInd], dinfo);
+      }
+      int yresp = (int) dinfo._adaptedFrame.vec(respInd).at(rowInd);
+      double logSumExp = computeMultinomialEtasSpeedUp(etas, probs); // calculate the prob of each class
+      dinfo._adaptedFrame.vec("__glm_sumExp").set(rowInd, probs[nclass]);
+      dinfo._adaptedFrame.vec("__glm_logSumExp").set(rowInd, logSumExp);
+      likelihood += logSumExp - etas[yresp];
+      // calculate w hessian without the predictors and complete w, not just lower triangle
+      calculateW(w, yresp, probs);
+      // Add predictors to hessian to generate transpose(X)*W*X
+      addX2W(xtx, hessian, w, dinfo, rowInd, nclass, ncoeffPClass);
+      // calculate wz W*Etas+Grad again, without the predictors
+      calculateWZ(w, wz, yresp, probs, etas);
+      // add predictors to wz to form XY
+      addX2Wz(xy, wz, dinfo, rowInd, nclass, ncoeffPClass);
+    }
+    return likelihood;
+  }
+
+  public double getInnerProduct(int rowInd, double[] coeffs, DataInfo dinfo) {
+    double innerP = coeffs[coeffs.length-1];  // add the intercept term;
+
+    for (int predInd = 0; predInd < dinfo._cats; predInd++) { // categorical columns
+      int id = dinfo.getCategoricalId(predInd, (int) dinfo._adaptedFrame.vec(predInd).at(rowInd));
+      innerP += coeffs[id];
+    }
+
+    int numOff = dinfo.numStart();
+    int cidOff = dinfo._cats;
+    for (int cid=0; cid < dinfo._nums; cid++) {
+      double scale = dinfo._normMul!=null?dinfo._normMul[cid]:1;
+      double off = dinfo._normSub != null?dinfo._normSub[cid]:0;
+      innerP += coeffs[cid+numOff]*(dinfo._adaptedFrame.vec(cid+cidOff).at(rowInd)-off)*scale;
+    }
+
+    return innerP;
+  }
+  
+  public void addX2W(double[][] xtx, double[][] hessian, double[][] w, DataInfo dinfo, int rowInd, int nclass, int coeffPClass) {
+    int numOff = dinfo._cats; // start of numerical columns
+    int interceptInd = coeffPClass-1;
+    // generate XTX first
+    for (int index=0; index < coeffPClass; index++) {   // initialize matrix to zero
+      Arrays.fill(xtx[index], 0.0); 
+    }
+    for (int predInd=0; predInd < dinfo._cats; predInd++) { 
+      int rid = dinfo.getCategoricalId(predInd, (int) dinfo._adaptedFrame.vec(predInd).at(rowInd));
+      for (int predInd2=0; predInd2 <= predInd; predInd2++) { // cat x cat
+        int cid = dinfo.getCategoricalId(predInd2, (int) dinfo._adaptedFrame.vec(predInd2).at(rowInd));
+        xtx[rid][cid] = 1;
+      }
+      
+      // intercept x cat
+      xtx[interceptInd][rid] = 1;
+    }
+    for (int predInd = 0; predInd < dinfo._nums; predInd++) {
+      int rid = predInd+numOff;
+      double scale = dinfo._normMul!=null?dinfo._normMul[predInd]:1;
+      double off = dinfo._normSub != null?dinfo._normSub[predInd]:0;
+      double d = (dinfo._adaptedFrame.vec(rid).at(rowInd)-off)*scale;
+      for (int predInd2 = 0; predInd2 < dinfo._cats; predInd2++) {   // num x cat
+        int cid = dinfo.getCategoricalId(predInd2, (int) dinfo._adaptedFrame.vec(predInd2).at(rowInd));
+        xtx[dinfo._numOffsets[predInd]][cid] = d;
+      }
+    }
+    for (int predInd=0; predInd < dinfo._nums; predInd++) { // num x num
+      int rid = predInd+numOff;
+      double scale = dinfo._normMul!=null?dinfo._normMul[predInd]:1;
+      double off = dinfo._normSub != null?dinfo._normSub[predInd]:0;
+      double d = (dinfo._adaptedFrame.vec(rid).at(rowInd)-off)*scale;
+      // intercept x num
+      xtx[interceptInd][dinfo._numOffsets[predInd]] = d;
+      for (int predInd2=0; predInd2 <= predInd; predInd2++) {
+        scale = dinfo._normMul!=null?dinfo._normMul[predInd2]:1;
+        off = dinfo._normSub != null?dinfo._normSub[predInd2]:0;
+        d *= (dinfo._adaptedFrame.vec(rid).at(rowInd)-off)*scale;
+        xtx[dinfo._numOffsets[predInd]][dinfo._numOffsets[predInd2]] = d;
+      }
+    }
+    xtx[interceptInd][interceptInd] = 1;
+    // copy the lower triangle to the uppder triangle of xtx
+    for (int rInd = 0; rInd < coeffPClass; rInd++) {
+      for (int cInd=rInd+1; cInd < coeffPClass; cInd++) {
+        xtx[rInd][cInd] = xtx[cInd][rInd];
+      }
+    }
+    
+    for (int classInd=0; classInd < nclass; classInd++) {
+      for (int classInd2 = 0; classInd2 < nclass; classInd2++) {
+        for (int rpredInd = 0; rpredInd < coeffPClass; rpredInd++) {
+          for (int cpredInd = 0; cpredInd < coeffPClass; cpredInd++) {
+            hessian[classInd*coeffPClass+rpredInd][classInd2*coeffPClass+cpredInd]+=w[classInd][classInd2]*xtx[rpredInd][cpredInd];
+          }
+        }
+      }
+    }
+  }
+  
+  public void addX2Wz(double[] xy, double[] wz, DataInfo dinfo, int rowInd, int nclass, int coeffPClass) {
+    for (int predInd = 0; predInd < dinfo._cats; predInd++) { // cat
+      int cid = dinfo.getCategoricalId(predInd, (int) dinfo._adaptedFrame.vec(predInd).at(rowInd));
+      for (int classInd = 0; classInd < nclass; classInd++) {
+        xy[classInd*coeffPClass+cid] += wz[classInd];
+      }
+    }
+    
+    for (int predInd = 0; predInd < dinfo._nums; predInd++) { // num
+      double scale = dinfo._normMul!=null?dinfo._normMul[predInd]:1;
+      double off = dinfo._normSub != null?dinfo._normSub[predInd]:0;
+      int cid = predInd+dinfo._cats;
+      double d = (dinfo._adaptedFrame.vec(cid).at(rowInd)-off)*scale;
+      for (int classInd = 0; classInd < nclass; classInd++) {
+        xy[classInd*coeffPClass+cid] += wz[classInd]*d;
+      }
+    }
+    
+    for (int classInd=0; classInd < nclass; classInd++) { // intercept terms
+      xy[(classInd+1)*coeffPClass-1] += wz[classInd];
+    }
+  }
+  
+  public void calculateW(double[][] w, int y, double[] probs) {
+    int nclass = w.length;
+    for (int rclassInd=0; rclassInd < nclass; rclassInd++) {
+      for (int cclassInd=0; cclassInd < nclass; cclassInd++) {
+        w[rclassInd][cclassInd] = (rclassInd==y&&cclassInd==y)?(probs[y]-probs[y]*probs[y]):-probs[rclassInd]*probs[cclassInd];
+      }
+    }
+  }
+
+  public void calculateWZ(double[][] w, double[] wz, int y, double[] probs, double[] etas) {
+    int nclass = wz.length;
+    
+    for (int rclassInd=0; rclassInd < nclass; rclassInd++) {
+      wz[rclassInd] += rclassInd==y?(1-probs[y]):-probs[rclassInd]; // gradient part
+      for (int cclassInd=0; cclassInd < nclass; cclassInd++) {
+        wz[rclassInd] += w[rclassInd][cclassInd]*etas[cclassInd];   // due to transpose(W)*beta
+      }
+    }
+  }
+
+  @Test
+  public void testMultinomialGradientSpeedUp(){
+    Scope.enter();
+    Frame fr, f1, f2, f3;
+    // get new coefficients, 7 classes and 53 predictor+intercept
+    Random rand = new Random();
+    rand.setSeed(12345);
+    int nclass = 4;
+    double threshold = 1e-10;
+    DataInfo dinfo=null;
+    int numRows = 40;
     
     try {
       f1 = TestUtil.generate_enum_only(2, numRows, nclass, 0);
@@ -532,7 +763,7 @@ public class GLMBasicTestMultinomial extends TestUtil {
       GLMParameters params = new GLMParameters(Family.multinomial);
       params._response_column = f1._names[4];
       params._ignored_columns = new String[]{};
-      params._train = parsed;
+      params._train = fr._key;
       params._lambda = new double[]{0.5};
       params._alpha = new double[]{0.5};
       
@@ -564,24 +795,26 @@ public class GLMBasicTestMultinomial extends TestUtil {
     double likelihood = 0;
     int numRows = (int) dinfo._adaptedFrame.numRows();
     int respInd = dinfo._adaptedFrame.numCols()-1;
-    double[][] etas = new double[numRows][nclass];
-    double[] coeffs = new double[ncoeffPClass];
+    double[] etas = new double[nclass];
     double[] probs = new double[nclass+1];
+    double[][] multinomialBetas = new double[nclass][ncoeffPClass];
+    for (int classInd = 0; classInd < nclass; classInd++) {
+      System.arraycopy(initialBeta,classInd*ncoeffPClass, multinomialBetas[classInd], 0, ncoeffPClass);
+    }
     
     // calculate the etas for each class
     for (int rowInd=0; rowInd < numRows; rowInd++) {
       for (int classInd = 0; classInd < nclass; classInd++) { // calculate beta*coeff+beta0
-        System.arraycopy(initialBeta, classInd*ncoeffPClass, coeffs, 0, ncoeffPClass);  // copy over coefficient for class classInd
-        etas[rowInd][classInd] = getInnerProduct(rowInd, coeffs, dinfo);
+        etas[classInd] = getInnerProduct(rowInd, multinomialBetas[classInd], dinfo);
       }
       int yresp = (int) dinfo._adaptedFrame.vec(respInd).at(rowInd);
-      double logSumExp = computeMultinomialEtasSpeedUp(etas[rowInd], probs);
-      likelihood += logSumExp-etas[rowInd][yresp];
+      double logSumExp = computeMultinomialEtasSpeedUp(etas, probs);
+      likelihood += logSumExp-etas[yresp];
       for (int classInd = 0; classInd < nclass; classInd++) { // calculate the multiplier here
-        etas[rowInd][classInd] = classInd==yresp?(probs[classInd]-1):probs[classInd];
+        etas[classInd] = classInd==yresp?(probs[classInd]-1):probs[classInd];
       }
       // apply the multiplier and update the gradient accordingly
-      updateGradient(gradient, nclass, ncoeffPClass, dinfo, rowInd, etas[rowInd]);
+      updateGradient(gradient, nclass, ncoeffPClass, dinfo, rowInd, etas);
     }
     
     // apply learning rate and regularization constant
@@ -615,27 +848,7 @@ public class GLMBasicTestMultinomial extends TestUtil {
       gradient[(classInd + 1) * ncoeffPclass - 1] += multiplier[classInd];
     }
   }
-
-  public double getInnerProduct(int rowInd, double[] coeffs, DataInfo dinfo) {
-    double innerP = coeffs[coeffs.length-1];  // add the intercept term;
-
-    for (int predInd = 0; predInd < dinfo._cats; predInd++) { // categorical columns
-      int id = dinfo.getCategoricalId(predInd, (int) dinfo._adaptedFrame.vec(predInd).at(rowInd));
-      innerP += coeffs[id];
-    }
-
-    int numOff = dinfo.numStart();
-    int cidOff = dinfo._cats;
-    for (int cid=0; cid < dinfo._nums; cid++) {
-      double scale = dinfo._normMul!=null?dinfo._normMul[cid]:1;
-      double off = dinfo._normSub != null?dinfo._normSub[cid]:0;
-      innerP += coeffs[cid+numOff]*(dinfo._adaptedFrame.vec(cid+cidOff).at(rowInd)-off)*scale;
-    }
-    
-    return innerP;
-  }
-
-
+  
   // This method needs to calculate Pr(yi=c) for each class c and to 1/(sum of all exps
   public double  computeMultinomialEtasSpeedUp(double [] etas, double [] exps) {
     double sumExp = 0;
